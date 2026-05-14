@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
-import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+import subprocess
+import sys
 import time
 
 st.title("Auditor de Carga de Contenido")
@@ -34,117 +36,106 @@ st.markdown("""
 - Contenido SEO dentro de `contentSEO`
 """)
 
-def analyze_url(url):
+def normalize_url(url):
+    url = str(url).strip()
+
+    if not url or url.lower() == "nan":
+        return ""
+
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
+    return url
+
+def install_playwright_browser():
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True
+        )
+    except Exception:
+        pass
+
+def analyze_page(page, url):
 
     try:
+        url = normalize_url(url)
 
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Referer": "https://www.google.com/"
-        }
-
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=20
-        )
-
-        status_code = response.status_code
-
-        if status_code == 403:
-
+        if not url:
             return {
-                "status_code": status_code,
+                "status_code": "",
                 "title": "",
-                "h1": "403 ERROR",
+                "h1": "",
                 "h2": "",
                 "meta_description": "",
                 "contenido": "",
-                "error": "Bloqueo 403 del servidor/CDN"
+                "error": "URL vacía o inválida"
             }
 
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
+        response = page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=45000
         )
 
-        # TITLE
-        title = soup.title.string if soup.title else ""
+        time.sleep(2)
 
-        # H1
+        status_code = response.status if response else ""
+
+        html = page.content()
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
+
         h1 = soup.find("h1")
         h1 = h1.get_text(" ", strip=True) if h1 else ""
 
-        # H2
         h2_tags = soup.find_all("h2")
-
         h2_list = []
 
         for h2 in h2_tags:
-
-            text = h2.get_text(
-                " ",
-                strip=True
-            )
-
+            text = h2.get_text(" ", strip=True)
             if text:
                 h2_list.append(text)
 
         h2_text = " | ".join(h2_list)
 
-        # META DESCRIPTION
-        meta = soup.find(
-            "meta",
-            attrs={"name": "description"}
-        )
+        meta = soup.find("meta", attrs={"name": "description"})
 
-        meta = (
-            meta["content"]
+        meta_description = (
+            meta["content"].strip()
             if meta and meta.get("content")
             else ""
         )
 
-        # CONTENIDO SEO
-        content_seo = soup.find(
-            "div",
-            id="contentSEO"
-        )
+        content_seo = soup.find("div", id="contentSEO")
 
         if content_seo:
-
-            contenido = content_seo.get_text(
-                " ",
-                strip=True
-            )
-
-            contenido = " ".join(
-                contenido.split()
-            )
-
+            contenido = content_seo.get_text(" ", strip=True)
+            contenido = " ".join(contenido.split())
         else:
-
             contenido = ""
+
+        error = ""
+
+        if status_code == 403:
+            error = "403 detectado incluso usando navegador real"
+
+        if not contenido:
+            error = error or "No se encontró div id='contentSEO'"
 
         return {
             "status_code": status_code,
             "title": title,
             "h1": h1,
             "h2": h2_text,
-            "meta_description": meta,
+            "meta_description": meta_description,
             "contenido": contenido,
-            "error": ""
+            "error": error
         }
 
     except Exception as e:
-
         return {
             "status_code": "",
             "title": "",
@@ -158,18 +149,14 @@ def analyze_url(url):
 if uploaded_file:
 
     if uploaded_file.name.endswith(".csv"):
-
         df = pd.read_csv(
             uploaded_file,
             sep=None,
             engine="python"
         )
-
     else:
-
         df = pd.read_excel(uploaded_file)
 
-    # LIMPIEZA COLUMNAS
     df.columns = (
         df.columns
         .astype(str)
@@ -177,10 +164,7 @@ if uploaded_file:
         .str.lower()
     )
 
-    required_columns = [
-        "url",
-        "keyword_enviada"
-    ]
+    required_columns = ["url", "keyword_enviada"]
 
     missing_columns = [
         col for col in required_columns
@@ -188,69 +172,75 @@ if uploaded_file:
     ]
 
     if missing_columns:
-
-        st.error(
-            f"Faltan columnas: {missing_columns}"
-        )
-
+        st.error(f"Faltan columnas: {missing_columns}")
         st.stop()
 
     results = []
 
     progress_bar = st.progress(0)
+    status_text = st.empty()
 
     total_urls = len(df)
 
-    for index, row in df.iterrows():
+    try:
+        with sync_playwright() as p:
 
-        url = str(
-            row["url"]
-        ).strip()
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception:
+                install_playwright_browser()
+                browser = p.chromium.launch(headless=True)
 
-        keyword = str(
-            row["keyword_enviada"]
-        ).strip()
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="es-CL",
+                viewport={"width": 1440, "height": 1200}
+            )
 
-        data = analyze_url(url)
+            page = context.new_page()
 
-        result = {
-            "url": url,
-            "keyword_enviada": keyword,
-            "status_code": data.get("status_code", ""),
-            "title": data.get("title", ""),
-            "h1": data.get("h1", ""),
-            "h2": data.get("h2", ""),
-            "meta_description": data.get(
-                "meta_description",
-                ""
-            ),
-            "contenido": data.get(
-                "contenido",
-                ""
-            ),
-            "error": data.get("error", "")
-        }
+            for i, (_, row) in enumerate(df.iterrows(), start=1):
 
-        results.append(result)
+                url = normalize_url(row["url"])
+                keyword = str(row["keyword_enviada"]).strip()
 
-        progress = (index + 1) / total_urls
+                status_text.write(f"Analizando {i}/{total_urls}: {url}")
 
-        progress_bar.progress(progress)
+                data = analyze_page(page, url)
 
-        # PAUSA ENTRE REQUESTS
-        time.sleep(1.5)
+                results.append({
+                    "url": url,
+                    "keyword_enviada": keyword,
+                    "status_code": data.get("status_code", ""),
+                    "title": data.get("title", ""),
+                    "h1": data.get("h1", ""),
+                    "h2": data.get("h2", ""),
+                    "meta_description": data.get("meta_description", ""),
+                    "contenido": data.get("contenido", ""),
+                    "error": data.get("error", "")
+                })
+
+                progress_bar.progress(i / total_urls)
+
+                time.sleep(1)
+
+            browser.close()
+
+    except Exception as e:
+        st.error(f"Error general ejecutando Playwright: {e}")
+        st.stop()
 
     result_df = pd.DataFrame(results)
 
-    st.success(
-        f"{len(result_df)} URLs analizadas"
-    )
+    st.success(f"{len(result_df)} URLs analizadas")
 
     st.dataframe(result_df)
 
-    csv = result_df.to_csv(
-        index=False
-    )
+    csv = result_df.to_csv(index=False)
 
     st.download_button(
         "Descargar CSV",
